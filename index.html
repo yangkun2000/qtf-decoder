@@ -7,35 +7,37 @@
   <title>QTF 文本二维码还原</title>
   <style>
     :root{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#172331;background:#eef3f7}
-    *{box-sizing:border-box}body{margin:0}.wrap{max-width:720px;margin:auto;padding:20px}
-    header{background:#17324d;color:white;padding:24px 20px}header div{max-width:720px;margin:auto}
+    *{box-sizing:border-box}body{margin:0}.wrap{max-width:760px;margin:auto;padding:20px}
+    header{background:#17324d;color:white;padding:24px 20px}header div{max-width:760px;margin:auto}
     h1{font-size:1.55rem;margin:0 0 6px}h2{font-size:1.15rem}.sub{opacity:.8;margin:0}
     .card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 5px 20px #17324d14}
     .progress{height:12px;background:#dbe4eb;border-radius:99px;overflow:hidden}.bar{height:100%;width:0;background:#16856b}
-    .status{font-weight:650;margin:12px 0 4px}.details{color:#526273;font-size:.92rem;overflow-wrap:anywhere}
+    .status{font-weight:650;margin:12px 0 4px}.details{color:#526273;font-size:.92rem;overflow-wrap:anywhere;line-height:1.55}
     button,.file-label{display:inline-block;border:0;border-radius:9px;padding:11px 15px;margin:6px 4px 0 0;
       background:#176b87;color:white;font:inherit;font-weight:650;cursor:pointer}
     button.secondary,.file-label.secondary{background:#e3ebf0;color:#17324d}
     button.danger{background:#a33a3a}button:disabled{opacity:.45;cursor:default}
-    input[type=file]{display:none}video{display:none;width:100%;border-radius:10px;margin-top:12px;background:#111}
+    input[type=file]{display:none}video{display:none;width:100%;max-height:58vh;object-fit:cover;border-radius:10px;margin-top:12px;background:#111}
     textarea{width:100%;min-height:220px;border:1px solid #c9d4dc;border-radius:9px;padding:12px;font:14px ui-monospace,monospace}
     .notice{font-size:.88rem;color:#526273;line-height:1.55}.error{color:#a11f2f}.ok{color:#08715b}
   </style>
 </head>
 <body>
-  <header><div><h1>QTF 文本二维码还原</h1><p class="sub">分片仅在本机浏览器中处理，不上传文件内容</p></div></header>
+  <header><div><h1>QTF 文本二维码还原</h1><p class="sub">数据只在二维码与本机浏览器中处理，不上传文本内容</p></div></header>
   <main class="wrap">
     <section class="card">
-      <h2>扫描进度</h2>
+      <h2>接收进度</h2>
       <div class="progress"><div id="bar" class="bar"></div></div>
-      <div id="status" class="status">等待扫描 QTF1 分片</div>
-      <div id="details" class="details">请使用手机系统相机扫描第一个二维码。</div>
-      <button id="camera">连续扫码</button>
+      <div id="status" class="status">等待扫描启动码或 QTF1 分片</div>
+      <div id="details" class="details">视频模式：先扫描电脑上的启动码，再点击“开始接收”。</div>
+      <button id="camera">开始接收</button>
+      <button id="switch" class="secondary">切换摄像头</button>
       <label class="file-label secondary" for="image">识别二维码图片</label>
       <input id="image" type="file" accept="image/*" capture="environment">
       <button id="clear" class="danger">清除此文件进度</button>
       <video id="video" playsinline muted></video>
-      <p class="notice">“连续扫码”和图片识别依赖浏览器 BarcodeDetector 支持。若按钮不可用，使用系统相机逐个扫描即可；每次打开本页都会自动累计分片。</p>
+      <canvas id="canvas" hidden></canvas>
+      <p class="notice">请让电脑二维码完整进入取景框，保持手机稳定。漏扫的数据帧会在电脑下一轮播放时自动补齐。</p>
     </section>
     <section id="resultCard" class="card" hidden>
       <h2>还原结果</h2>
@@ -44,155 +46,201 @@
       <button id="download" class="secondary">下载原文件</button>
     </section>
   </main>
+  <script src="jsQR.js"></script>
   <script>
   "use strict";
-  const $ = id => document.getElementById(id);
-  let currentId = "";
-  let restoredBytes = null;
-  let restoredName = "restored.txt";
-  let stream = null;
-  let scanning = false;
+  const $=id=>document.getElementById(id);
+  let currentId="",restoredBytes=null,restoredName="restored.txt";
+  let stream=null,scanning=false,facingMode="environment",nativeDetector=null;
+  let scanBusy=false,lastRaw="",lastRawAt=0;
 
-  function fromB64url(value) {
-    const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4-value.length%4)%4);
-    const binary = atob(padded), out = new Uint8Array(binary.length);
-    for (let i=0;i<binary.length;i++) out[i]=binary.charCodeAt(i);
+  function fromB64url(value){
+    const padded=value.replace(/-/g,"+").replace(/_/g,"/")+"=".repeat((4-value.length%4)%4);
+    const binary=atob(padded),out=new Uint8Array(binary.length);
+    for(let i=0;i<binary.length;i++)out[i]=binary.charCodeAt(i);
     return out;
   }
-  function textFromB64url(value) {
-    return new TextDecoder("utf-8",{fatal:true}).decode(fromB64url(value));
+  function textFromB64url(value){return new TextDecoder("utf-8",{fatal:true}).decode(fromB64url(value))}
+  function validMeta(id,total,digest,size){
+    return /^[0-9a-f]{16}$/.test(id)&&Number.isInteger(total)&&total>=1&&total<=9999&&
+      /^[0-9a-f]{64}$/.test(digest)&&Number.isInteger(size)&&size>=0&&size<=1048576;
   }
-  function parsePayload(raw) {
-    let hash = raw;
-    try { hash = new URL(raw).hash; } catch (_) {}
-    if (hash.startsWith("#")) hash=hash.slice(1);
-    const parts=hash.split("/");
-    if (parts.length!==8 || parts[0]!=="QTF1") throw new Error("这不是有效的 QTF1 分片。");
-    const [,id,indexText,totalText,digest,sizeText,name64,chunk]=parts;
-    const index=Number(indexText), total=Number(totalText), size=Number(sizeText);
-    if (!/^[0-9a-f]{16}$/.test(id) || !/^[0-9a-f]{64}$/.test(digest) ||
-        !Number.isInteger(index) || !Number.isInteger(total) || index<1 || index>total ||
-        total>9999 || !Number.isInteger(size) || size<0 || size>1048576 ||
-        !/^[A-Za-z0-9_-]+$/.test(chunk)) throw new Error("分片字段无效或已损坏。");
-    return {id,index,total,digest,size,name:textFromB64url(name64),chunk};
+  function parsePayload(raw){
+    let value=raw;
+    try{const url=new URL(raw);if(url.hash)value=url.hash.slice(1)}catch(_){}
+    if(value.startsWith("#"))value=value.slice(1);
+    const p=value.split("/");
+    if(p[0]==="QTF1"&&p.length===8){
+      const index=Number(p[2]),total=Number(p[3]),size=Number(p[5]);
+      if(!validMeta(p[1],total,p[4],size)||!Number.isInteger(index)||index<1||index>total||
+        !/^[A-Za-z0-9_-]+$/.test(p[7]))throw new Error("QTF1 分片字段无效或已损坏。");
+      return{kind:"data",protocol:"QTF1",id:p[1],index,total,digest:p[4],size,
+        name:textFromB64url(p[6]),fps:0,chunk:p[7]};
+    }
+    if(p[0]==="QTV1S"&&p.length===7){
+      const total=Number(p[2]),size=Number(p[4]),fps=Number(p[6]);
+      if(!validMeta(p[1],total,p[3],size)||!Number.isInteger(fps)||fps<1||fps>8)
+        throw new Error("QTV1 启动码无效。");
+      return{kind:"start",protocol:"QTV1",id:p[1],total,digest:p[3],size,
+        name:textFromB64url(p[5]),fps};
+    }
+    if(p[0]==="QTV1D"&&p.length===5){
+      const index=Number(p[2]),total=Number(p[3]);
+      if(!/^[0-9a-f]{16}$/.test(p[1])||!Number.isInteger(index)||index<1||
+        !Number.isInteger(total)||total<1||total>9999||index>total||
+        !/^[A-Za-z0-9_-]+$/.test(p[4]))throw new Error("QTV1 数据帧无效。");
+      return{kind:"data",protocol:"QTV1",id:p[1],index,total,chunk:p[4]};
+    }
+    throw new Error("这不是支持的 QTF1/QTV1 二维码。");
   }
-  function load(id) {
-    try { return JSON.parse(localStorage.getItem("qtf1:"+id)); } catch (_) { return null; }
+  function load(id){try{return JSON.parse(localStorage.getItem("qtf:"+id))}catch(_){return null}}
+  function persist(state){
+    try{localStorage.setItem("qtf:"+state.id,JSON.stringify(state))}
+    catch(_){throw new Error("浏览器存储空间不足，请清除旧进度后重试。")}
   }
-  function save(part) {
+  function savePart(part){
     let state=load(part.id);
-    if (!state) state={id:part.id,total:part.total,digest:part.digest,size:part.size,name:part.name,chunks:{}};
-    if (state.total!==part.total || state.digest!==part.digest || state.size!==part.size)
-      throw new Error("该分片与当前同标识文件不一致。");
-    state.chunks[part.index]=part.chunk;
-    localStorage.setItem("qtf1:"+part.id,JSON.stringify(state));
-    currentId=part.id;
-    return state;
+    if(!state)state={id:part.id,protocol:part.protocol,total:part.total,digest:"",size:0,
+      name:"restored.txt",fps:part.fps||2,chunks:{},lastIndex:0,round:1};
+    if(state.total!==part.total||state.protocol!==part.protocol)
+      throw new Error("该二维码与当前同标识文件不一致。");
+    if(part.kind==="start"){
+      if(state.digest&&state.digest!==part.digest)throw new Error("启动码校验信息不一致。");
+      Object.assign(state,{digest:part.digest,size:part.size,name:part.name,fps:part.fps});
+    }else{
+      if(part.digest){
+        if(state.digest&&state.digest!==part.digest)throw new Error("分片校验信息不一致。");
+        Object.assign(state,{digest:part.digest,size:part.size,name:part.name});
+      }
+      if(state.lastIndex&&part.index<state.lastIndex)state.round++;
+      state.lastIndex=part.index;
+      state.chunks[part.index]=part.chunk;
+    }
+    persist(state);currentId=part.id;return state;
   }
-  async function sha256Hex(bytes) {
+  async function sha256Hex(bytes){
     const digest=await crypto.subtle.digest("SHA-256",bytes);
-    return [...new Uint8Array(digest)].map(x=>x.toString(16).padStart(2,"0")).join("");
+    return[...new Uint8Array(digest)].map(x=>x.toString(16).padStart(2,"0")).join("");
   }
-  async function inflate(bytes) {
-    if (!("DecompressionStream" in window)) throw new Error("此浏览器不支持解压，请升级浏览器后重试。");
-    const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+  async function inflate(bytes){
+    if(!("DecompressionStream"in window))throw new Error("此浏览器不支持解压，请升级浏览器。");
+    const output=new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(output).arrayBuffer());
   }
-  function render(state,message="") {
-    const count=Object.keys(state.chunks).length;
+  function render(state,message=""){
+    const count=Object.keys(state.chunks).length,missing=state.total-count;
     $("bar").style.width=(count/state.total*100)+"%";
-    $("status").textContent=message || `已收集 ${count} / ${state.total} 个分片`;
+    $("status").textContent=message||`已接收 ${count} / ${state.total} 帧，缺少 ${missing} 帧`;
     $("status").className="status";
-    $("details").textContent=`文件：${state.name}　原始大小：${state.size} 字节　标识：${state.id}`;
+    const remaining=state.fps?Math.ceil(missing/state.fps):0;
+    $("details").textContent=`文件：${state.name}　协议：${state.protocol}　轮次：${state.round||1}`+
+      `　缺失：${missing}`+(remaining?`　理想情况下至少还需约 ${remaining} 秒`:"")+`　标识：${state.id}`;
   }
-  async function finish(state) {
-    if (Object.keys(state.chunks).length!==state.total) return;
-    $("status").textContent="分片齐全，正在解压和校验...";
-    let encoded="";
-    for(let i=1;i<=state.total;i++) {
-      if (!state.chunks[i]) return;
-      encoded+=state.chunks[i];
-    }
+  async function finish(state){
+    if(!state.digest||Object.keys(state.chunks).length!==state.total)return;
+    $("status").textContent="数据帧齐全，正在解压和校验...";
+    let encoded="";for(let i=1;i<=state.total;i++){if(!state.chunks[i])return;encoded+=state.chunks[i]}
     const bytes=await inflate(fromB64url(encoded));
-    if (bytes.length!==state.size || await sha256Hex(bytes)!==state.digest)
-      throw new Error("完整性校验失败，分片可能损坏。");
+    if(bytes.length!==state.size||await sha256Hex(bytes)!==state.digest)
+      throw new Error("完整性校验失败，数据帧可能损坏。");
     const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);
-    restoredBytes=bytes; restoredName=state.name || "restored.txt";
-    $("result").value=text; $("resultCard").hidden=false;
-    $("status").textContent="还原完成，SHA-256 校验通过";
-    $("status").className="status ok";
+    restoredBytes=bytes;restoredName=state.name||"restored.txt";
+    $("result").value=text;$("resultCard").hidden=false;
+    $("status").textContent="还原完成，SHA-256 校验通过";$("status").className="status ok";
+    stopCamera();
   }
-  async function accept(raw) {
-    try {
-      const part=parsePayload(raw), state=save(part);
-      render(state,`已接收第 ${part.index} 个分片，共 ${state.total} 个`);
-      history.replaceState(null,"",location.pathname+location.search);
+  async function accept(raw){
+    try{
+      const part=parsePayload(raw),state=savePart(part);
+      render(state,part.kind==="start"
+        ?`启动码已接收：共 ${state.total} 个数据帧，请点击“开始接收”`
+        :`已接收第 ${part.index} 帧，共 ${state.total} 帧`);
+      if(location.hash)history.replaceState(null,"",location.pathname+location.search);
       await finish(state);
-      if (navigator.vibrate) navigator.vibrate(80);
-    } catch (e) {
-      $("status").textContent=e.message;
-      $("status").className="status error";
-    }
+      if(navigator.vibrate)navigator.vibrate(60);
+    }catch(e){$("status").textContent=e.message;$("status").className="status error"}
   }
-  async function startCamera() {
-    if (!("BarcodeDetector" in window)) {
-      $("status").textContent="此浏览器不支持连续扫码，请使用系统相机。";
-      $("status").className="status error"; return;
-    }
-    if (scanning) { stopCamera(); return; }
-    try {
-      const detector=new BarcodeDetector({formats:["qr_code"]});
-      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
-      $("video").srcObject=stream; $("video").style.display="block"; await $("video").play();
-      scanning=true; $("camera").textContent="停止连续扫码";
-      let last="",lastTime=0;
-      const loop=async()=>{
-        if(!scanning)return;
-        try {
-          const codes=await detector.detect($("video"));
-          const now=Date.now();
-          for(const code of codes) if(code.rawValue && (code.rawValue!==last || now-lastTime>1800)){
-            last=code.rawValue;lastTime=now;await accept(code.rawValue);
-          }
-        } catch(_){}
-        requestAnimationFrame(loop);
-      }; loop();
-    } catch(e) {
-      $("status").textContent="无法启动相机："+e.message;
-      $("status").className="status error";
-    }
+  async function detectFrame(){
+    if(scanBusy||!scanning||$("video").readyState<2)return;
+    scanBusy=true;
+    try{
+      let raw="";
+      if(nativeDetector){
+        try{
+          const codes=await nativeDetector.detect($("video"));if(codes.length)raw=codes[0].rawValue||"";
+        }catch(_){nativeDetector=null}
+      }
+      if(!raw&&!nativeDetector&&window.jsQR){
+        const video=$("video"),canvas=$("canvas"),maxWidth=960;
+        const ratio=Math.min(1,maxWidth/video.videoWidth);
+        canvas.width=Math.max(1,Math.round(video.videoWidth*ratio));
+        canvas.height=Math.max(1,Math.round(video.videoHeight*ratio));
+        const context=canvas.getContext("2d",{willReadFrequently:true});
+        context.drawImage(video,0,0,canvas.width,canvas.height);
+        const image=context.getImageData(0,0,canvas.width,canvas.height);
+        const code=jsQR(image.data,image.width,image.height,{inversionAttempts:"dontInvert"});
+        if(code)raw=code.data;
+      }
+      const now=Date.now();
+      if(raw&&(raw!==lastRaw||now-lastRawAt>1200)){lastRaw=raw;lastRawAt=now;await accept(raw)}
+    }catch(_){}
+    finally{scanBusy=false}
+  }
+  async function startCamera(){
+    if(scanning){stopCamera();return}
+    try{
+      if("BarcodeDetector"in window){
+        try{nativeDetector=new BarcodeDetector({formats:["qr_code"]})}catch(_){nativeDetector=null}
+      }
+      if(!nativeDetector&&!window.jsQR)throw new Error("二维码识别组件未加载，请确认 jsQR.js 已部署。");
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facingMode},
+        width:{ideal:1920},height:{ideal:1080}},audio:false});
+      $("video").srcObject=stream;$("video").style.display="block";await $("video").play();
+      scanning=true;$("camera").textContent="停止接收";
+      const loop=async()=>{if(!scanning)return;await detectFrame();setTimeout(loop,40)};loop();
+    }catch(e){$("status").textContent="无法启动摄像头："+e.message;$("status").className="status error"}
   }
   function stopCamera(){
     scanning=false;if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;
-    $("video").style.display="none";$("camera").textContent="连续扫码";
+    $("video").style.display="none";$("camera").textContent="开始接收";
   }
   $("camera").onclick=startCamera;
+  $("switch").onclick=async()=>{facingMode=facingMode==="environment"?"user":"environment";
+    if(scanning){stopCamera();await startCamera()}};
   $("image").onchange=async event=>{
-    if(!("BarcodeDetector" in window)){alert("此浏览器不支持图片识别。");return}
     try{
-      const bitmap=await createImageBitmap(event.target.files[0]);
-      const codes=await new BarcodeDetector({formats:["qr_code"]}).detect(bitmap);
-      if(!codes.length)throw new Error("图片中未识别到二维码");
-      await accept(codes[0].rawValue);
+      const bitmap=await createImageBitmap(event.target.files[0]);let raw="";
+      if("BarcodeDetector"in window){
+        try{const codes=await new BarcodeDetector({formats:["qr_code"]}).detect(bitmap);
+          if(codes.length)raw=codes[0].rawValue}catch(_){}
+      }
+      if(!raw&&window.jsQR){
+        const canvas=$("canvas");canvas.width=bitmap.width;canvas.height=bitmap.height;
+        const context=canvas.getContext("2d",{willReadFrequently:true});context.drawImage(bitmap,0,0);
+        const image=context.getImageData(0,0,canvas.width,canvas.height);
+        const code=jsQR(image.data,image.width,image.height);if(code)raw=code.data;
+      }
+      if(!raw)throw new Error("图片中未识别到二维码");await accept(raw);
     }catch(e){$("status").textContent=e.message;$("status").className="status error"}
     event.target.value="";
   };
   $("clear").onclick=()=>{
     if(!currentId){$("status").textContent="当前没有可清除的文件进度。";return}
-    if(confirm("确定清除此文件的全部已扫描分片吗？")){
-      localStorage.removeItem("qtf1:"+currentId);currentId="";restoredBytes=null;
+    if(confirm("确定清除此文件的全部已接收数据吗？")){
+      localStorage.removeItem("qtf:"+currentId);currentId="";restoredBytes=null;
       $("bar").style.width="0";$("status").textContent="已清除，等待重新扫描";
-      $("details").textContent="请使用手机系统相机扫描第一个二维码。";$("resultCard").hidden=true;
+      $("details").textContent="请扫描启动码或 QTF1 分片。";$("resultCard").hidden=true;
     }
   };
   $("copy").onclick=async()=>{await navigator.clipboard.writeText($("result").value);$("copy").textContent="已复制"};
   $("download").onclick=()=>{
-    if(!restoredBytes)return;
-    const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([restoredBytes],{type:"text/plain;charset=utf-8"}));
+    if(!restoredBytes)return;const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([restoredBytes],{type:"text/plain;charset=utf-8"}));
     a.download=restoredName;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   };
   addEventListener("pagehide",stopCamera);
-  if(location.hash) accept(location.href);
+  addEventListener("hashchange",()=>{if(location.hash)accept(location.href)});
+  if(location.hash)accept(location.href);
   </script>
 </body>
 </html>
