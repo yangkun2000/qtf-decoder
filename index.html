@@ -19,6 +19,8 @@
     button.danger{background:#a33a3a}button:disabled{opacity:.45;cursor:default}
     input[type=file]{display:none}video{display:none;width:100%;max-height:58vh;object-fit:cover;border-radius:10px;margin-top:12px;background:#111}
     textarea{width:100%;min-height:220px;border:1px solid #c9d4dc;border-radius:9px;padding:12px;font:14px ui-monospace,monospace}
+    .files{display:grid;gap:8px}.file{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px;background:#f4f7f9;border-radius:9px}
+    .file span{flex:1;min-width:220px;overflow-wrap:anywhere}.file button{margin:0;padding:7px 10px}
     .notice{font-size:.88rem;color:#526273;line-height:1.55}.error{color:#a11f2f}.ok{color:#08715b}
   </style>
 </head>
@@ -41,16 +43,22 @@
     </section>
     <section id="resultCard" class="card" hidden>
       <h2>还原结果</h2>
-      <textarea id="result" readonly></textarea>
-      <button id="copy">复制文本</button>
-      <button id="download" class="secondary">下载原文件</button>
+      <div id="fileList" class="files"></div>
+      <textarea id="result" readonly hidden></textarea>
+      <button id="copy" hidden>复制文本</button>
+      <button id="download" class="secondary">下载全部 ZIP</button>
+      <button id="share">分享全部 ZIP</button>
+      <div id="shareStatus" class="details"></div>
+      <p class="notice">分享功能会调用手机系统分享面板，可选择 QQ、微信、邮件、网盘等已安装应用。文件不会由本网页上传到服务器；具体可用应用由手机系统和浏览器决定。</p>
     </section>
   </main>
+  <script src="qtf-zip.js"></script>
   <script src="jsQR.js"></script>
   <script>
   "use strict";
   const $=id=>document.getElementById(id);
-  let currentId="",restoredBytes=null,restoredName="restored.txt";
+  let currentId="",restoredBytes=null,restoredName="restored.txt",restoredFiles=[],zipBytes=null;
+  let packageDigest="";
   let stream=null,scanning=false,facingMode="environment",nativeDetector=null;
   let scanBusy=false,lastRaw="",lastRawAt=0;
 
@@ -63,7 +71,7 @@
   function textFromB64url(value){return new TextDecoder("utf-8",{fatal:true}).decode(fromB64url(value))}
   function validMeta(id,total,digest,size){
     return /^[0-9a-f]{16}$/.test(id)&&Number.isInteger(total)&&total>=1&&total<=9999&&
-      /^[0-9a-f]{64}$/.test(digest)&&Number.isInteger(size)&&size>=0&&size<=1048576;
+      /^[0-9a-f]{64}$/.test(digest)&&Number.isInteger(size)&&size>=0&&size<=2097152;
   }
   function parsePayload(raw){
     let value=raw;
@@ -91,7 +99,28 @@
         !/^[A-Za-z0-9_-]+$/.test(p[4]))throw new Error("QTV1 数据帧无效。");
       return{kind:"data",protocol:"QTV1",id:p[1],index,total,chunk:p[4]};
     }
-    throw new Error("这不是支持的 QTF1/QTV1 二维码。");
+    if(p[0]==="QTF2"&&p.length===8){
+      const index=Number(p[2]),total=Number(p[3]),size=Number(p[5]),fileCount=Number(p[6]);
+      if(!validMeta(p[1],total,p[4],size)||!Number.isInteger(index)||index<1||index>total||
+        !Number.isInteger(fileCount)||fileCount<2||fileCount>256||
+        !/^[A-Za-z0-9_-]+$/.test(p[7]))throw new Error("QTF2 分片无效。");
+      return{kind:"data",protocol:"QTF2",id:p[1],index,total,digest:p[4],size,
+        fileCount,fps:0,chunk:p[7]};
+    }
+    if(p[0]==="QTV2S"&&p.length===7){
+      const total=Number(p[2]),size=Number(p[4]),fileCount=Number(p[5]),fps=Number(p[6]);
+      if(!validMeta(p[1],total,p[3],size)||!Number.isInteger(fileCount)||fileCount<2||
+        fileCount>256||!Number.isInteger(fps)||fps<1||fps>8)throw new Error("QTV2 启动码无效。");
+      return{kind:"start",protocol:"QTV2",id:p[1],total,digest:p[3],size,fileCount,fps};
+    }
+    if(p[0]==="QTV2D"&&p.length===5){
+      const index=Number(p[2]),total=Number(p[3]);
+      if(!/^[0-9a-f]{16}$/.test(p[1])||!Number.isInteger(index)||index<1||
+        !Number.isInteger(total)||total<1||total>9999||index>total||
+        !/^[A-Za-z0-9_-]+$/.test(p[4]))throw new Error("QTV2 数据帧无效。");
+      return{kind:"data",protocol:"QTV2",id:p[1],index,total,chunk:p[4]};
+    }
+    throw new Error("这不是支持的 QTF1/QTV1/QTF2/QTV2 二维码。");
   }
   function load(id){try{return JSON.parse(localStorage.getItem("qtf:"+id))}catch(_){return null}}
   function persist(state){
@@ -101,16 +130,18 @@
   function savePart(part){
     let state=load(part.id);
     if(!state)state={id:part.id,protocol:part.protocol,total:part.total,digest:"",size:0,
-      name:"restored.txt",fps:part.fps||2,chunks:{},lastIndex:0,round:1};
+      name:"restored.txt",fileCount:part.fileCount||1,fps:part.fps||2,chunks:{},lastIndex:0,round:1};
     if(state.total!==part.total||state.protocol!==part.protocol)
       throw new Error("该二维码与当前同标识文件不一致。");
     if(part.kind==="start"){
       if(state.digest&&state.digest!==part.digest)throw new Error("启动码校验信息不一致。");
-      Object.assign(state,{digest:part.digest,size:part.size,name:part.name,fps:part.fps});
+      Object.assign(state,{digest:part.digest,size:part.size,name:part.name||"qtf_bundle.zip",
+        fileCount:part.fileCount||1,fps:part.fps});
     }else{
       if(part.digest){
         if(state.digest&&state.digest!==part.digest)throw new Error("分片校验信息不一致。");
-        Object.assign(state,{digest:part.digest,size:part.size,name:part.name});
+        Object.assign(state,{digest:part.digest,size:part.size,name:part.name||"qtf_bundle.zip",
+          fileCount:part.fileCount||1});
       }
       if(state.lastIndex&&part.index<state.lastIndex)state.round++;
       state.lastIndex=part.index;
@@ -126,6 +157,76 @@
     if(!("DecompressionStream"in window))throw new Error("此浏览器不支持解压，请升级浏览器。");
     const output=new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
     return new Uint8Array(await new Response(output).arrayBuffer());
+  }
+  function readU16(data,offset){return(data[offset]<<8)|data[offset+1]}
+  function readU32(data,offset){return(data[offset]*0x1000000)+(data[offset+1]<<16)+(data[offset+2]<<8)+data[offset+3]}
+  async function parseBundle(data,expectedCount){
+    if(data.length<6||String.fromCharCode(...data.slice(0,4))!=="QTB2")throw new Error("QTB2 文件包头无效。");
+    const count=readU16(data,4);if(count!==expectedCount||count<2||count>256)throw new Error("QTB2 文件数量不一致。");
+    const decoder=new TextDecoder("utf-8",{fatal:true}),files=[];let offset=6;
+    for(let i=0;i<count;i++){
+      if(offset+38>data.length)throw new Error("QTB2 条目被截断。");
+      const nameLength=readU16(data,offset),size=readU32(data,offset+2);
+      const expected=[...data.slice(offset+6,offset+38)].map(x=>x.toString(16).padStart(2,"0")).join("");
+      offset+=38;if(offset+nameLength+size>data.length)throw new Error("QTB2 文件内容被截断。");
+      const name=decoder.decode(data.slice(offset,offset+nameLength));offset+=nameLength;
+      const bytes=data.slice(offset,offset+size);offset+=size;
+      if(await sha256Hex(bytes)!==expected)throw new Error(`文件校验失败：${name}`);
+      files.push({name,data:bytes,sha256:expected});
+    }
+    if(offset!==data.length)throw new Error("QTB2 包含未识别的尾部数据。");
+    return files;
+  }
+  function downloadBytes(bytes,name,type="application/octet-stream"){
+    const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([bytes],{type}));
+    a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  }
+  function shareFileSupported(file){
+    return typeof navigator.share==="function"&&
+      (!navigator.canShare||navigator.canShare({files:[file]}));
+  }
+  async function shareBytes(bytes,name,type,statusTarget){
+    if(typeof File!=="function"){
+      downloadBytes(bytes,name,type);
+      statusTarget.textContent="当前浏览器不支持文件分享，已改为下载到手机本地。";
+      statusTarget.className="details";
+      return false;
+    }
+    const file=new File([bytes],name,{type});
+    if(!shareFileSupported(file)){
+      downloadBytes(bytes,name,type);
+      statusTarget.textContent="当前浏览器不支持文件分享，已改为下载到手机本地。";
+      statusTarget.className="details";
+      return false;
+    }
+    try{
+      await navigator.share({files:[file],title:name});
+      statusTarget.textContent="系统分享操作已完成。";
+      statusTarget.className="details ok";
+      return true;
+    }catch(e){
+      if(e&&e.name==="AbortError"){
+        statusTarget.textContent="已取消分享。";
+        statusTarget.className="details";
+        return false;
+      }
+      downloadBytes(bytes,name,type);
+      statusTarget.textContent="分享未成功，已改为下载到手机本地。";
+      statusTarget.className="details";
+      return false;
+    }
+  }
+  function renderFiles(){
+    $("fileList").replaceChildren();
+    restoredFiles.forEach((file,index)=>{
+      const row=document.createElement("div");row.className="file";
+      const label=document.createElement("span");label.textContent=`${file.name}　${file.data.length} 字节　SHA-256 已通过`;
+      const download=document.createElement("button");download.className="secondary";download.textContent="下载";
+      download.onclick=()=>downloadBytes(file.data,file.name,"text/plain;charset=utf-8");
+      const share=document.createElement("button");share.textContent="分享";
+      share.onclick=()=>shareBytes(file.data,file.name,"text/plain;charset=utf-8",$("shareStatus"));
+      row.append(label,download,share);$("fileList").append(row);
+    });
   }
   function render(state,message=""){
     const count=Object.keys(state.chunks).length,missing=state.total-count;
@@ -143,9 +244,18 @@
     const bytes=await inflate(fromB64url(encoded));
     if(bytes.length!==state.size||await sha256Hex(bytes)!==state.digest)
       throw new Error("完整性校验失败，数据帧可能损坏。");
-    const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);
-    restoredBytes=bytes;restoredName=state.name||"restored.txt";
-    $("result").value=text;$("resultCard").hidden=false;
+    packageDigest=state.digest;restoredBytes=bytes;restoredName=state.name||"restored.txt";
+    if(state.protocol==="QTF2"||state.protocol==="QTV2"){
+      restoredFiles=await parseBundle(bytes,state.fileCount);
+      zipBytes=QtfZip.makeZip(restoredFiles);renderFiles();
+      $("result").hidden=true;$("copy").hidden=true;
+    }else{
+      const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+      restoredFiles=[{name:restoredName,data:bytes,sha256:state.digest}];
+      zipBytes=QtfZip.makeZip(restoredFiles);renderFiles();
+      $("result").value=text;$("result").hidden=false;$("copy").hidden=false;
+    }
+    $("resultCard").hidden=false;
     $("status").textContent="还原完成，SHA-256 校验通过";$("status").className="status ok";
     stopCamera();
   }
@@ -228,15 +338,20 @@
     if(!currentId){$("status").textContent="当前没有可清除的文件进度。";return}
     if(confirm("确定清除此文件的全部已接收数据吗？")){
       localStorage.removeItem("qtf:"+currentId);currentId="";restoredBytes=null;
+      restoredFiles=[];zipBytes=null;packageDigest="";
       $("bar").style.width="0";$("status").textContent="已清除，等待重新扫描";
-      $("details").textContent="请扫描启动码或 QTF1 分片。";$("resultCard").hidden=true;
+      $("details").textContent="请扫描启动码或 QTF1/QTF2 分片。";
+      $("resultCard").hidden=true;$("shareStatus").textContent="";
     }
   };
   $("copy").onclick=async()=>{await navigator.clipboard.writeText($("result").value);$("copy").textContent="已复制"};
   $("download").onclick=()=>{
-    if(!restoredBytes)return;const a=document.createElement("a");
-    a.href=URL.createObjectURL(new Blob([restoredBytes],{type:"text/plain;charset=utf-8"}));
-    a.download=restoredName;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    if(zipBytes)downloadBytes(zipBytes,`QTF_${packageDigest.slice(0,12)}.zip`,"application/zip");
+  };
+  $("share").onclick=()=>{
+    if(!zipBytes)return;
+    const name=`QTF_${packageDigest.slice(0,12)}.zip`;
+    shareBytes(zipBytes,name,"application/zip",$("shareStatus"));
   };
   addEventListener("pagehide",stopCamera);
   addEventListener("hashchange",()=>{if(location.hash)accept(location.href)});
