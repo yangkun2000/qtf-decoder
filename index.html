@@ -71,7 +71,7 @@
   function textFromB64url(value){return new TextDecoder("utf-8",{fatal:true}).decode(fromB64url(value))}
   function validMeta(id,total,digest,size){
     return /^[0-9a-f]{16}$/.test(id)&&Number.isInteger(total)&&total>=1&&total<=9999&&
-      /^[0-9a-f]{64}$/.test(digest)&&Number.isInteger(size)&&size>=0&&size<=2097152;
+      /^[0-9a-f]{64}$/.test(digest)&&Number.isInteger(size)&&size>=0&&size<=4194304;
   }
   function parsePayload(raw){
     let value=raw;
@@ -102,14 +102,14 @@
     if(p[0]==="QTF2"&&p.length===8){
       const index=Number(p[2]),total=Number(p[3]),size=Number(p[5]),fileCount=Number(p[6]);
       if(!validMeta(p[1],total,p[4],size)||!Number.isInteger(index)||index<1||index>total||
-        !Number.isInteger(fileCount)||fileCount<2||fileCount>256||
+        !Number.isInteger(fileCount)||fileCount<1||fileCount>256||
         !/^[A-Za-z0-9_-]+$/.test(p[7]))throw new Error("QTF2 分片无效。");
       return{kind:"data",protocol:"QTF2",id:p[1],index,total,digest:p[4],size,
         fileCount,fps:0,chunk:p[7]};
     }
     if(p[0]==="QTV2S"&&p.length===7){
       const total=Number(p[2]),size=Number(p[4]),fileCount=Number(p[5]),fps=Number(p[6]);
-      if(!validMeta(p[1],total,p[3],size)||!Number.isInteger(fileCount)||fileCount<2||
+      if(!validMeta(p[1],total,p[3],size)||!Number.isInteger(fileCount)||fileCount<1||
         fileCount>256||!Number.isInteger(fps)||fps<1||fps>8)throw new Error("QTV2 启动码无效。");
       return{kind:"start",protocol:"QTV2",id:p[1],total,digest:p[3],size,fileCount,fps};
     }
@@ -160,16 +160,26 @@
   }
   function readU16(data,offset){return(data[offset]<<8)|data[offset+1]}
   function readU32(data,offset){return(data[offset]*0x1000000)+(data[offset+1]<<16)+(data[offset+2]<<8)+data[offset+3]}
+  function safeZipName(name){
+    const parts=String(name).replace(/\\/g,"/").split("/").filter(p=>p&&p!==".");
+    if(!parts.length||parts.some(p=>p===".."||p.includes(":")||p.includes("\0")))
+      throw new Error("QTB2 文件路径不安全。");
+    return parts.join("/");
+  }
+  function leafName(name){
+    const parts=String(name).replace(/\\/g,"/").split("/").filter(Boolean);
+    return parts.length?parts[parts.length-1]:"restored.bin";
+  }
   async function parseBundle(data,expectedCount){
     if(data.length<6||String.fromCharCode(...data.slice(0,4))!=="QTB2")throw new Error("QTB2 文件包头无效。");
-    const count=readU16(data,4);if(count!==expectedCount||count<2||count>256)throw new Error("QTB2 文件数量不一致。");
+    const count=readU16(data,4);if(count!==expectedCount||count<1||count>256)throw new Error("QTB2 文件数量不一致。");
     const decoder=new TextDecoder("utf-8",{fatal:true}),files=[];let offset=6;
     for(let i=0;i<count;i++){
       if(offset+38>data.length)throw new Error("QTB2 条目被截断。");
       const nameLength=readU16(data,offset),size=readU32(data,offset+2);
       const expected=[...data.slice(offset+6,offset+38)].map(x=>x.toString(16).padStart(2,"0")).join("");
       offset+=38;if(offset+nameLength+size>data.length)throw new Error("QTB2 文件内容被截断。");
-      const name=decoder.decode(data.slice(offset,offset+nameLength));offset+=nameLength;
+      const name=safeZipName(decoder.decode(data.slice(offset,offset+nameLength)));offset+=nameLength;
       const bytes=data.slice(offset,offset+size);offset+=size;
       if(await sha256Hex(bytes)!==expected)throw new Error(`文件校验失败：${name}`);
       files.push({name,data:bytes,sha256:expected});
@@ -222,9 +232,9 @@
       const row=document.createElement("div");row.className="file";
       const label=document.createElement("span");label.textContent=`${file.name}　${file.data.length} 字节　SHA-256 已通过`;
       const download=document.createElement("button");download.className="secondary";download.textContent="下载";
-      download.onclick=()=>downloadBytes(file.data,file.name,"text/plain;charset=utf-8");
+      download.onclick=()=>downloadBytes(file.data,leafName(file.name),"application/octet-stream");
       const share=document.createElement("button");share.textContent="分享";
-      share.onclick=()=>shareBytes(file.data,file.name,"text/plain;charset=utf-8",$("shareStatus"));
+      share.onclick=()=>shareBytes(file.data,leafName(file.name),"application/octet-stream",$("shareStatus"));
       row.append(label,download,share);$("fileList").append(row);
     });
   }
