@@ -290,7 +290,7 @@
           const codes=await nativeDetector.detect($("video"));if(codes.length)raw=codes[0].rawValue||"";
         }catch(_){nativeDetector=null}
       }
-      if(!raw&&!nativeDetector&&window.jsQR){
+      if(!raw&&window.jsQR){
         const video=$("video"),canvas=$("canvas"),maxWidth=960;
         const ratio=Math.min(1,maxWidth/video.videoWidth);
         canvas.width=Math.max(1,Math.round(video.videoWidth*ratio));
